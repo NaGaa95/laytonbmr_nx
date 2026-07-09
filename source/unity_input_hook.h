@@ -9,6 +9,10 @@
 void nx_install_input_hooks(uintptr_t il2cpp_base);
 void nx_install_language_hook(uintptr_t il2cpp_base);
 
+/* Route UnityEngine.PlayerPrefs (the game's save) through our persistent prefs.kv store, since
+ * Unity's native PlayerPrefs never writes to disk on Switch. string_new = il2cpp_string_new. */
+void nx_install_playerprefs_hooks(uintptr_t il2cpp_base, void *string_new);
+
 /* Push the current touch (Unity screen space, bottom-left origin, px) each frame. */
 void nx_input_hook_update(int active, float ux, float uy);
 

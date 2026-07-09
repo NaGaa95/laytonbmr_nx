@@ -534,6 +534,25 @@ static uint64_t path_ino(const char *path) {
 static void fd_ino_set(int fd, const char *path) { if (fd >= 0 && fd < FD_INO_MAX) g_fd_ino[fd] = path_ino(path); }
 static void fd_ino_clear(int fd) { if (fd >= 0 && fd < FD_INO_MAX) g_fd_ino[fd] = 0; }
 
+// libnx buffers sdmc: writes -- they reach the physical card only on fsdevCommitDevice() or a
+// clean unmount. Exiting via HOME kills the process (title override), so that commit never runs
+// and saves written this session vanish on reboot. Track fds opened for writing and commit the
+// card when they close, so a save persists the moment the game finishes writing it.
+#define WFD_MAX 4096
+static unsigned char g_write_fd[WFD_MAX];
+int nx_sd_dirty = 0;   /* a file has been opened for writing since the last commit */
+static void mark_write_fd(int fd)   { nx_sd_dirty = 1; if (fd >= 0 && fd < WFD_MAX) g_write_fd[fd] = 1; }
+static void commit_write_fd(int fd) { if (fd >= 0 && fd < WFD_MAX && g_write_fd[fd]) {
+                                        g_write_fd[fd] = 0; nx_sd_dirty = 0; fsdevCommitDevice("sdmc"); } }
+
+/* Commit any pending writes to the physical card. Called periodically from the render loop and
+ * after the game's save (nx_save_prefs), so the save survives a HOME-kill / reboot. */
+void nx_sd_flush(void) {
+  if (!nx_sd_dirty) return;
+  nx_sd_dirty = 0;
+  fsdevCommitDevice("sdmc");
+}
+
 int open_fake(const char *path, int flags, ...) {
   int mode = 0666;
   if (flags & LINUX_O_CREAT) { va_list va; va_start(va, flags); mode = va_arg(va, int); va_end(va); }
@@ -574,6 +593,7 @@ int open_fake(const char *path, int flags, ...) {
   }
   if (fd >= 0) {
     fd_ino_set(fd, path);
+    if (writing) mark_write_fd(fd);
     struct stat _st;
     if (fstat(fd, &_st) == 0) {
       debugPrintf("[io] open(%s,0x%x) -> %d size=%lld\n", path, flags, fd, (long long)_st.st_size);
@@ -1415,6 +1435,7 @@ FILE *fopen_fake(const char *path, const char *mode) {
   }
   if (!f)
     return NULL;
+  if (writing) mark_write_fd(fileno(f));
   debugPrintf("[io] fopen(%s,%s) -> %p\n", path, mode, (void *)f);
   if (strchr(mode, 'r')) {
     const char *ext = strrchr(path, '.');
@@ -1457,7 +1478,8 @@ size_t fread_fake(void *ptr, size_t size, size_t n, FILE *f) {
 int fputc_fake(int c, FILE *f) { if (is_fake_file(f)) return c; return fputc(c, f); }
 int fputs_fake(const char *s, FILE *f) { if (is_fake_file(f)) { debugPrintf("stdio: %s", s); return 0; } return fputs(s, f); }
 int fflush_fake(FILE *f) { if (is_fake_file(f) || f == NULL) return 0; return fflush(f); }
-int fclose_fake(FILE *f) { if (is_fake_file(f)) return 0; return fclose(f); }
+int fclose_fake(FILE *f) { if (is_fake_file(f)) return 0;
+  int fd = fileno(f); int r = fclose(f); commit_write_fd(fd); return r; }
 int ferror_fake(FILE *f) { if (is_fake_file(f)) return 0; return ferror(f); }
 int feof_fake(FILE *f) { if (is_fake_file(f)) return 1; return feof(f); }
 int fileno_fake(FILE *f) { if (is_fake_file(f)) return ((const uint8_t *)f - &fake_sF[0][0]) / 0x100; return fileno(f); }
@@ -1534,7 +1556,9 @@ int close_fake(int fd) {
   ra_detach(fd);
   fd_ino_clear(fd);
   if (fakefd_is_fake(fd)) return fakefd_close(fd);
-  return close(fd);
+  int r = close(fd);
+  commit_write_fd(fd);   /* flush a just-written save to the physical SD */
+  return r;
 }
 int pipe_fake(int fds[2]) { return fakefd_pipe(fds); }
 int poll_fake(void *fds, unsigned long nfds, int timeout) { (void)fds; (void)nfds; (void)timeout; return 0; }

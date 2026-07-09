@@ -227,12 +227,10 @@ static float g_cursor_x = 960, g_cursor_y = 540;  /* stick cursor, 1920x1080 bot
 static float g_last_tx = 360, g_last_ty = 640;    /* last touch (game space), reused on release */
 static int   g_cursor_activity = 0;               /* frames left to keep the cursor visible in handheld */
 
-/* Virtual-cursor state consumed by the GL overlay (imports.c egl_SwapBuffers_log).
- * Same 1920x1080 bottom-left GL/Unity screen space the touch is injected in, so the
- * drawn crosshair lands exactly where A taps. */
+/* Virtual-cursor state consumed by the GL overlay (imports.c). Same 1920x1080 bottom-left
+ * screen space the touch is injected in, so the drawn dot lands exactly where A taps. */
 int   nx_cursor_show = 0;
 float nx_cursor_x = 960.0f, nx_cursor_y = 540.0f;
-int   nx_cursor_press = 0;
 
 void android_native_input_init(void){
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -260,8 +258,8 @@ void android_native_feed_hid(void){
     int dx = ls.x, dy = ls.y;
     int moved = (dx > 3200 || dx < -3200 || dy > 3200 || dy < -3200);   /* ~10% deadzone kills drift */
     if (moved) {
-      g_cursor_x += (dx / 32767.0f) * 26.0f;
-      g_cursor_y += (dy / 32767.0f) * 26.0f;            /* stick up -> +Y (Unity up) */
+      g_cursor_x += (dx / 32767.0f) * 34.0f;
+      g_cursor_y += (dy / 32767.0f) * 34.0f;            /* stick up -> +Y (Unity up) */
       if (g_cursor_x < 0) g_cursor_x = 0; else if (g_cursor_x > screen_width)  g_cursor_x = screen_width;
       if (g_cursor_y < 0) g_cursor_y = 0; else if (g_cursor_y > screen_height) g_cursor_y = screen_height;
     }
@@ -276,7 +274,6 @@ void android_native_feed_hid(void){
     nx_cursor_show  = (docked || g_cursor_activity > 0);
     nx_cursor_x     = g_cursor_x;
     nx_cursor_y     = g_cursor_y;
-    nx_cursor_press = a_held;
   }
 
   g_last_tx = ux; g_last_ty = uy;

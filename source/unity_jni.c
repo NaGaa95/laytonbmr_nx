@@ -143,6 +143,14 @@ static void prefs_flush(void){
   debugPrintf("[prefs] flush: wrote %d entries to %s\n", g_kv_n, p);
 }
 
+/* PlayerPrefs write-through: the il2cpp PlayerPrefs hooks (unity_input_hook.c) route the game's
+ * PlayerPrefs through this persistent store, since Unity's own native PlayerPrefs never reaches
+ * disk on Switch. Loaded on boot by prefs_load(); flushed to prefs.kv (committed to SD) here. */
+void nx_prefs_set(char type, const char *key, const char *val) { if (key) kv_set(type, key, val ? val : ""); }
+const char *nx_prefs_get(const char *key) { KV *kv = key ? kv_get(key) : NULL; return kv ? kv->val : NULL; }
+void nx_prefs_del(const char *key) { if (key) kv_remove(key); }
+void nx_prefs_flush(void) { prefs_flush(); }
+
 /* ==========================================================================
  * getAll() boxed values: turn a stored KV into the Java object Unity expects.
  * Strings come back as a native FakeString (Unity reads them via

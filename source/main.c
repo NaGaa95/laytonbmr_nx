@@ -117,6 +117,7 @@ so_module main_mod, unity_mod, il2cpp_mod;
 
 /* defined in libc_shim.c; consumed by the GC stop-the-world bridge there */
 extern uintptr_t g_il2cpp_base;
+extern void nx_sd_flush(void);   /* libc_shim.c: periodic SD commit (save persistence) */
 
 /* Native engine clock. Our loop drives nativeRender directly and never delivers Choreographer frame
  * callbacks, so TimeManager's newTime freezes, deltaTime collapses, and async scene loads never
@@ -394,6 +395,23 @@ static fn_z        Unity_nativeDone;
 static fn_v        Unity_nativeApplicationUnload;
 static fn_vz       Unity_nativeUnityPlayerSetRunning;
 
+/* The game stores its save in Unity PlayerPrefs (key-based, e.g. getSlotUseSaveKey), which live in
+ * memory until PlayerPrefs.Save() writes them to the prefs file -- Unity normally does that on
+ * OnApplicationPause, an event we never get on a suspend-then-kill title override. So we call
+ * PlayerPrefs.Save() ourselves (periodically from the render loop, and on the applet background/
+ * exit hook if it fires) and commit the SD, so progress reaches the card during play. */
+extern void nx_prefs_flush(void);   /* unity_jni.c: write the (PlayerPrefs-routed) prefs.kv to disk */
+static void nx_save_prefs(void) {
+  nx_prefs_flush();
+  nx_sd_flush();
+}
+static AppletHookCookie g_applet_cookie;
+static void nx_applet_hook(AppletHookType hook, void *param) {
+  (void)param;
+  if (hook == AppletHookType_OnFocusState || hook == AppletHookType_OnExitRequest)
+    nx_save_prefs();
+}
+
 /* Shrink Unity's memory-region granularity 256MB -> 64MB, applied IN-MEMORY to
  * libunity after it is loaded+relocated but before any allocator runs. Lets us
  * ship STOCK game data (no patched libunity.so on the SD) -- the .nro carries the
@@ -597,6 +615,11 @@ int main(int argc, char *argv[]) {
    * language field, so this single hook re-languages every scene/resource load. */
   nx_install_language_hook((uintptr_t)il2cpp_mod.load_virtbase);
 
+  /* Save persistence: the game saves via UnityEngine.PlayerPrefs, whose native flush never
+   * reaches disk on Switch. Route Set/Get/Save through our persistent prefs.kv store. */
+  nx_install_playerprefs_hooks((uintptr_t)il2cpp_mod.load_virtbase,
+                               (void *)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_string_new"));
+
   /* Main thread runs init_array + the engine lifecycle; give it its own stable
    * bionic TLS for the stack-protector guard (tpidr_el0+0x28). */
   static uint8_t main_tls[BIONIC_TLS_SIZE] __attribute__((aligned(16)));
@@ -679,6 +702,9 @@ int main(int argc, char *argv[]) {
     Unity_nativeUnityPlayerSetRunning(fake_env, fake_unityplayer_thiz, 1);
   debugPrintf("[boot] resumed + focus=true + setRunning(1)\n");
 
+  /* Drive OnApplicationPause (-> the game's save) when the applet is backgrounded/closed. */
+  appletHook(&g_applet_cookie, nx_applet_hook, NULL);
+
   /* CRITICAL ORDER: install GC-disable + clock fix BEFORE the first nativeRender.
    * The game allocates managed objects on its first frames, which can trigger a
    * Boehm GC; the GC stops the world with POSIX signals Switch never delivers, so
@@ -725,6 +751,8 @@ int main(int argc, char *argv[]) {
     if (!Unity_nativeRender(fake_env, fake_unityplayer_thiz)) break;
     if (frame < 5 || (frame % 120) == 0) debugPrintf("[boot] frame %d rendered\n", frame);
     frame++;
+    if ((frame % 120) == 0) nx_sd_flush();   /* commit any pending save to the SD ~every 2s */
+    if (frame > 0 && (frame % 600) == 0) nx_save_prefs();  /* flush the game's PlayerPrefs save to disk ~every 10s */
     /* FRAME LIMITER (~60fps). With no real display vsync our loop would spin as fast
      * as it can, flooding the GPU/compositor with buffer submissions -> a full-system
      * crash on the first real content present. Pace to the panel's 60Hz: sleep until

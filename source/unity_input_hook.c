@@ -12,6 +12,8 @@
  */
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 #include "unity_input_hook.h"
 
@@ -108,4 +110,94 @@ void nx_input_hook_update(int active, float ux, float uy) {
     g_hook_count = 0; g_hook_btn = 0; g_hook_phase = 3;
   }
   prev = active;
+}
+
+/* ---- PlayerPrefs persistence ---------------------------------------------
+ * The game saves via UnityEngine.PlayerPrefs, but Unity's native PlayerPrefs never reaches disk
+ * on Switch (it doesn't use our JNI SharedPreferences and its native flush is a no-op), so
+ * progress lived only in RAM and vanished on reboot. We replace the Set/Get/Delete/Save methods
+ * so the game's PlayerPrefs go through our own persistent store (unity_jni.c prefs.kv), loaded on
+ * boot and flushed to the SD. RVAs are the UnityEngine.PlayerPrefs methods. */
+extern void        nx_prefs_set(char type, const char *key, const char *val);   /* unity_jni.c */
+extern const char *nx_prefs_get(const char *key);
+extern void        nx_prefs_del(const char *key);
+extern void        nx_prefs_flush(void);
+
+static void *(*g_il2cpp_string_new)(const char *);
+
+/* il2cpp System.String (arm64): length @0x10 (int32), UTF-16 chars @0x14. Malloc'd UTF-8 copy
+ * (caller frees); values can be large (serialized save blobs). */
+static char *il2str_dup(void *s) {
+  if (!s) return NULL;
+  int32_t len = *(int32_t *)((char *)s + 0x10);
+  if (len < 0) len = 0;
+  char *out = (char *)malloc((size_t)len * 3 + 1);
+  if (!out) return NULL;
+  const uint16_t *ch = (const uint16_t *)((char *)s + 0x14);
+  int o = 0;
+  for (int i = 0; i < len; i++) {
+    uint32_t c = ch[i];
+    if (c < 0x80)        out[o++] = (char)c;
+    else if (c < 0x800){ out[o++] = (char)(0xC0|(c>>6));  out[o++] = (char)(0x80|(c&0x3F)); }
+    else               { out[o++] = (char)(0xE0|(c>>12)); out[o++] = (char)(0x80|((c>>6)&0x3F)); out[o++] = (char)(0x80|(c&0x3F)); }
+  }
+  out[o] = 0;
+  return out;
+}
+static void *mkstr(const char *s) { return g_il2cpp_string_new ? g_il2cpp_string_new(s ? s : "") : (void *)0; }
+
+/* il2cpp static-method ABI: (real args..., MethodInfo*). */
+static void hk_pp_SetString(void *key, void *val, void *mi) {
+  (void)mi; char *k = il2str_dup(key), *v = il2str_dup(val);
+  if (k) nx_prefs_set('S', k, v ? v : "");
+  free(k); free(v);
+}
+static void hk_pp_SetInt(void *key, int32_t val, void *mi) {
+  (void)mi; char *k = il2str_dup(key), b[16];
+  if (k) { snprintf(b, sizeof b, "%d", (int)val); nx_prefs_set('I', k, b); }
+  free(k);
+}
+static void hk_pp_SetFloat(void *key, float val, void *mi) {
+  (void)mi; char *k = il2str_dup(key), b[32];
+  if (k) { snprintf(b, sizeof b, "%.9g", (double)val); nx_prefs_set('F', k, b); }
+  free(k);
+}
+static void *hk_pp_GetString2(void *key, void *def, void *mi) {
+  (void)mi; char *k = il2str_dup(key); const char *v = k ? nx_prefs_get(k) : NULL; free(k);
+  return v ? mkstr(v) : def;
+}
+static void *hk_pp_GetString1(void *key, void *mi) {
+  (void)mi; char *k = il2str_dup(key); const char *v = k ? nx_prefs_get(k) : NULL; free(k);
+  return mkstr(v ? v : "");
+}
+static int32_t hk_pp_GetInt2(void *key, int32_t def, void *mi) {
+  (void)mi; char *k = il2str_dup(key); const char *v = k ? nx_prefs_get(k) : NULL; free(k);
+  return v ? (int32_t)atoi(v) : def;
+}
+static float hk_pp_GetFloat2(void *key, float def, void *mi) {
+  (void)mi; char *k = il2str_dup(key); const char *v = k ? nx_prefs_get(k) : NULL; free(k);
+  return v ? (float)atof(v) : def;
+}
+static uint8_t hk_pp_HasKey(void *key, void *mi) {
+  (void)mi; char *k = il2str_dup(key); int h = (k && nx_prefs_get(k)); free(k); return h ? 1 : 0;
+}
+static void hk_pp_DeleteKey(void *key, void *mi) {
+  (void)mi; char *k = il2str_dup(key); if (k) nx_prefs_del(k); free(k);
+}
+static void hk_pp_Save(void *mi) { (void)mi; nx_prefs_flush(); }
+
+void nx_install_playerprefs_hooks(uintptr_t il2cpp_base, void *string_new) {
+  g_il2cpp_string_new = (void *(*)(const char *))string_new;
+  patch_jump(il2cpp_base + 0x1B9A1A8u, (void *)hk_pp_SetString);
+  patch_jump(il2cpp_base + 0x1B99D64u, (void *)hk_pp_SetInt);
+  patch_jump(il2cpp_base + 0x1B99F80u, (void *)hk_pp_SetFloat);
+  if (g_il2cpp_string_new) {   /* GetString needs to build a String; skip if unresolved (avoid NRE) */
+    patch_jump(il2cpp_base + 0x1B9A200u, (void *)hk_pp_GetString2); /* GetString(key,def)  */
+    patch_jump(il2cpp_base + 0x1B9A504u, (void *)hk_pp_GetString1); /* GetString(key)      */
+  }
+  patch_jump(il2cpp_base + 0x1B99DBCu, (void *)hk_pp_GetInt2);      /* covers GetInt(key)  */
+  patch_jump(il2cpp_base + 0x1B99FD8u, (void *)hk_pp_GetFloat2);    /* covers GetFloat(key)*/
+  patch_jump(il2cpp_base + 0x1B9A54Cu, (void *)hk_pp_HasKey);
+  patch_jump(il2cpp_base + 0x1B9A6FCu, (void *)hk_pp_DeleteKey);
+  patch_jump(il2cpp_base + 0x1B9A8C8u, (void *)hk_pp_Save);
 }
