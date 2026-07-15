@@ -14,7 +14,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET    := laytonbmr_nx
 APP_TITLE := Layton Brothers Mystery Room
 APP_AUTHOR := naga
-APP_VERSION := 1.0.0
+APP_VERSION := 1.0.1
 APP_ICON  := $(TOPDIR)/icon.jpg
 export APP_TITLE APP_AUTHOR APP_VERSION APP_ICON
 BUILD     := build

@@ -93,6 +93,42 @@
 #define LBMR_INITPAYMENT_RVA  0xE229CCu
 #define LBMR_INITPAYMENT_W0   0xa9bd5ffeu   /* stp x30, x23, [sp, #-0x30]! */
 
+/* Offline episode entitlements. The complete Android data set already contains every case;
+ * Google Play Billing only grants two products: mr_eng_pack_3456 (cases 3-6) and
+ * mr_eng_pack_789 (cases 7-9). Once SaveDataMediator finishes setup, call its stock
+ * buyMystery(0/1) methods on the Unity main thread. Besides saving the ownership bits, that method
+ * creates each paid mystery's per-slot environment data and applies its IsAppear state. Finally,
+ * report PackageParam::isUseShop=false because its Android billing UI cannot function on Switch.
+ * Some serialized menus can still enter EventUpdateShop. Skip the price, payment, and restore
+ * coroutines in full: each can raise BlockAllIcon and then dereference the absent Android payment
+ * object, throwing before its cleanup. Those operations are unnecessary because both products are
+ * already owned. Every called/patched method verifies its original instructions before it changes. */
+#define LBMR_OFFLINE_DLC_UNLOCK         1
+#define LBMR_GLOBAL_GET_INSTANCE_RVA    0xE57F38u
+#define LBMR_GLOBAL_GET_INSTANCE_W0     0xa9be57feu
+#define LBMR_GLOBAL_GET_INSTANCE_W1     0xa9014ff4u
+#define LBMR_SAVE_GET_INSTANCE_RVA      0xE6F55Cu
+#define LBMR_SAVE_GET_INSTANCE_W0       0xf81e0ffeu
+#define LBMR_SAVE_GET_INSTANCE_W1       0xa9014ff4u
+#define LBMR_SAVE_IS_END_SETUP_RVA      0xE6F5A4u
+#define LBMR_SAVE_IS_END_SETUP_W0       0x3940a000u   /* ldrb w0, [x0, #0x28] */
+#define LBMR_SAVE_IS_END_SETUP_W1       0xd65f03c0u   /* ret                   */
+#define LBMR_SAVE_BUY_MYSTERY_RVA       0xE6FF94u
+#define LBMR_SAVE_BUY_MYSTERY_W0        0xf81b0ffeu
+#define LBMR_SAVE_BUY_MYSTERY_W1        0xa90167fau
+#define LBMR_IS_USE_SHOP_RVA            0xF83054u
+#define LBMR_IS_USE_SHOP_W0             0xd10103ffu   /* sub sp, sp, #0x40         */
+#define LBMR_IS_USE_SHOP_W1             0xa90257feu   /* stp x30,x21,[sp,#0x20]   */
+#define LBMR_SHOP_PAYMENT_MOVENEXT_RVA  0xE8E3A4u
+#define LBMR_SHOP_PAYMENT_MOVENEXT_W0   0xd10143ffu   /* sub sp, sp, #0x50 */
+#define LBMR_SHOP_PAYMENT_MOVENEXT_W1   0xf90013feu   /* str x30, [sp,#0x20] */
+#define LBMR_SHOP_RESTORE_MOVENEXT_RVA  0xE8EF10u
+#define LBMR_SHOP_RESTORE_MOVENEXT_W0   0xd10183ffu   /* sub sp, sp, #0x60 */
+#define LBMR_SHOP_RESTORE_MOVENEXT_W1   0xf90013feu   /* str x30, [sp,#0x20] */
+#define LBMR_SHOP_PRICE_MOVENEXT_RVA    0xE8F62Cu
+#define LBMR_SHOP_PRICE_MOVENEXT_W0     0xd10203ffu   /* sub sp, sp, #0x80 */
+#define LBMR_SHOP_PRICE_MOVENEXT_W1     0xf90013feu   /* str x30, [sp,#0x20] */
+
 void unity_environment_init(const char *data_root);   /* unity_glue.c */
 
 static void *heap_so_base = NULL;
@@ -440,6 +476,122 @@ static int nx_patch_unity_regions(uintptr_t ub) {
   return 1;
 }
 
+/* Replace an IL2CPP method with `movz w0, #value; ret`. The relevant methods return an int/bool,
+ * so their AArch64 result lives in w0. Check both original prologue words: a wrong game version is
+ * left untouched rather than receiving a valid-looking patch at the wrong address. */
+static int nx_patch_il2cpp_return_u16(uintptr_t ib, const char *name, uint32_t rva,
+                                     uint32_t from0, uint32_t from1, uint16_t value) {
+  volatile uint32_t *p = (volatile uint32_t *)(ib + rva);
+  if (p[0] != from0 || p[1] != from1) {
+    debugPrintf("[dlc] %s mismatch @+0x%x: have 0x%08x,0x%08x want 0x%08x,0x%08x "
+                "-> NOT patched\n",
+                name, (unsigned)rva, p[0], p[1], from0, from1);
+    return 0;
+  }
+
+  const uint32_t code[2] = {
+    0x52800000u | ((uint32_t)value << 5), /* movz w0, #value */
+    0xd65f03c0u                          /* ret             */
+  };
+  if (so_patch_code((void *)p, code, sizeof code) != 0) {
+    debugPrintf("[dlc] %s patch write failed @libil2cpp+0x%x\n", name, (unsigned)rva);
+    return 0;
+  }
+
+  debugPrintf("[dlc] %s -> return %u @libil2cpp+0x%x\n",
+              name, (unsigned)value, (unsigned)rva);
+  return 1;
+}
+
+#if LBMR_OFFLINE_DLC_UNLOCK
+typedef void *  (*fn_il2cpp_get_instance)(void *method);
+typedef uint8_t (*fn_save_is_end_setup)(void *self, void *method);
+typedef void    (*fn_save_buy_mystery)(void *self, int32_t index, void *method);
+
+static fn_il2cpp_get_instance g_dlc_global_get_instance;
+static fn_il2cpp_get_instance g_dlc_save_get_instance;
+static fn_save_is_end_setup   g_dlc_save_is_end_setup;
+static fn_save_buy_mystery    g_dlc_save_buy_mystery;
+static int g_dlc_grant_state; /* 0=unavailable, 1=waiting for managed setup, 2=granted */
+
+static int nx_verify_il2cpp_entry(uintptr_t ib, const char *name, uint32_t rva,
+                                  uint32_t want0, uint32_t want1) {
+  volatile uint32_t *p = (volatile uint32_t *)(ib + rva);
+  if (p[0] == want0 && p[1] == want1) return 1;
+  debugPrintf("[dlc] %s mismatch @+0x%x: have 0x%08x,0x%08x want 0x%08x,0x%08x\n",
+              name, (unsigned)rva, p[0], p[1], want0, want1);
+  return 0;
+}
+
+/* Validate the ABI-sensitive managed calls before arming them. Do this before IL2CPP starts, but
+ * invoke buyMystery only later from the main render thread after SaveDataMediator.setup completes. */
+static int nx_prepare_offline_dlc(uintptr_t ib) {
+  int valid =
+    nx_verify_il2cpp_entry(ib, "Global.get_Instance", LBMR_GLOBAL_GET_INSTANCE_RVA,
+                           LBMR_GLOBAL_GET_INSTANCE_W0, LBMR_GLOBAL_GET_INSTANCE_W1) &&
+    nx_verify_il2cpp_entry(ib, "SaveDataMediator.get_Instance", LBMR_SAVE_GET_INSTANCE_RVA,
+                           LBMR_SAVE_GET_INSTANCE_W0, LBMR_SAVE_GET_INSTANCE_W1) &&
+    nx_verify_il2cpp_entry(ib, "SaveDataMediator.isEndSetup", LBMR_SAVE_IS_END_SETUP_RVA,
+                           LBMR_SAVE_IS_END_SETUP_W0, LBMR_SAVE_IS_END_SETUP_W1) &&
+    nx_verify_il2cpp_entry(ib, "SaveDataMediator.buyMystery", LBMR_SAVE_BUY_MYSTERY_RVA,
+                           LBMR_SAVE_BUY_MYSTERY_W0, LBMR_SAVE_BUY_MYSTERY_W1);
+  if (!valid) {
+    debugPrintf("[dlc] managed purchase signatures do not match -> offline grant NOT armed\n");
+    return 0;
+  }
+
+  g_dlc_global_get_instance = (fn_il2cpp_get_instance)(ib + LBMR_GLOBAL_GET_INSTANCE_RVA);
+  g_dlc_save_get_instance = (fn_il2cpp_get_instance)(ib + LBMR_SAVE_GET_INSTANCE_RVA);
+  g_dlc_save_is_end_setup = (fn_save_is_end_setup)(ib + LBMR_SAVE_IS_END_SETUP_RVA);
+  g_dlc_save_buy_mystery = (fn_save_buy_mystery)(ib + LBMR_SAVE_BUY_MYSTERY_RVA);
+  g_dlc_grant_state = 1;
+
+  int no_shop = nx_patch_il2cpp_return_u16(ib, "PackageParam.isUseShop",
+                                            LBMR_IS_USE_SHOP_RVA,
+                                            LBMR_IS_USE_SHOP_W0,
+                                            LBMR_IS_USE_SHOP_W1,
+                                            0);
+  int safe_price = nx_patch_il2cpp_return_u16(ib, "EventUpdateShop.getPrice.MoveNext",
+                                               LBMR_SHOP_PRICE_MOVENEXT_RVA,
+                                               LBMR_SHOP_PRICE_MOVENEXT_W0,
+                                               LBMR_SHOP_PRICE_MOVENEXT_W1,
+                                               0);
+  int safe_payment = nx_patch_il2cpp_return_u16(ib, "EventStartPayment.payment.MoveNext",
+                                                 LBMR_SHOP_PAYMENT_MOVENEXT_RVA,
+                                                 LBMR_SHOP_PAYMENT_MOVENEXT_W0,
+                                                 LBMR_SHOP_PAYMENT_MOVENEXT_W1,
+                                                 0);
+  int safe_restore = nx_patch_il2cpp_return_u16(ib, "EventStartRestore.restore.MoveNext",
+                                                 LBMR_SHOP_RESTORE_MOVENEXT_RVA,
+                                                 LBMR_SHOP_RESTORE_MOVENEXT_W0,
+                                                 LBMR_SHOP_RESTORE_MOVENEXT_W1,
+                                                 0);
+  debugPrintf("[dlc] offline episode grant armed; shop-policy=%s billing=%s/%s/%s\n",
+              no_shop ? "disabled" : "stock",
+              safe_price ? "no-price" : "stock-price",
+              safe_payment ? "no-payment" : "stock-payment",
+              safe_restore ? "no-restore" : "stock-restore");
+  return 1;
+}
+
+static void nx_try_grant_offline_dlc(void) {
+  if (g_dlc_grant_state != 1) return;
+
+  /* Both singletons must exist and save setup must be complete. buyMystery is then idempotent: it
+   * keeps already-owned bits and only applies missing environment/appearance state. */
+  if (!g_dlc_global_get_instance(NULL)) return;
+  void *save = g_dlc_save_get_instance(NULL);
+  if (!save || !g_dlc_save_is_end_setup(save, NULL)) return;
+
+  g_dlc_save_buy_mystery(save, 0, NULL);
+  g_dlc_save_buy_mystery(save, 1, NULL);
+  g_dlc_grant_state = 2;
+  nx_save_prefs();
+  debugPrintf("[dlc] stock buyMystery granted packs 0 and 1; episode save data initialized\n");
+}
+
+#endif
+
 int main(int argc, char *argv[]) {
   (void)argc; (void)argv;
   socketInitializeDefault();
@@ -605,6 +757,10 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
+#if LBMR_OFFLINE_DLC_UNLOCK
+  nx_prepare_offline_dlc((uintptr_t)il2cpp_mod.load_virtbase);
+#endif
+
   /* Touch input: patch the game's il2cpp UnityEngine.Input.* methods to return our Switch
    * touch state (Unity 6's JNI nativeInjectEvent accepts events but never reads touch coords,
    * so Input stays empty). android_native_feed_hid feeds the live touch each frame. */
@@ -749,6 +905,9 @@ int main(int argc, char *argv[]) {
     android_native_update_mode();
     android_native_feed_hid();
     if (!Unity_nativeRender(fake_env, fake_unityplayer_thiz)) break;
+#if LBMR_OFFLINE_DLC_UNLOCK
+    nx_try_grant_offline_dlc();
+#endif
     if (frame < 5 || (frame % 120) == 0) debugPrintf("[boot] frame %d rendered\n", frame);
     frame++;
     if ((frame % 120) == 0) nx_sd_flush();   /* commit any pending save to the SD ~every 2s */
