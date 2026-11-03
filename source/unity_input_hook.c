@@ -21,12 +21,25 @@ int   debugPrintf(char *fmt, ...);
 extern int screen_width, screen_height;
 int so_patch_code(void *dst, const void *src, unsigned long len);   /* so_util.c */
 
-/* ---- touch state, written by android_native_feed_hid every frame ---------- */
-int   g_hook_count = 0;                 /* Input.touchCount (0/1)                        */
-int   g_hook_btn   = 0;                 /* Input.GetMouseButton(0)                       */
+/* ---- touch state, written by android_native_feed_hid every frame ----------
+ * Multi-touch: one slot per finger, matched across frames by fingerId so a
+ * finger keeps its phase/delta when other fingers come and go. Slots in their
+ * Ended frame are kept for exactly one frame (Unity reports an ended touch
+ * in the frame it ends, then drops it), then removed. */
+typedef struct {
+  int32_t finger_id;
+  float x, y;               /* current Unity screen space (bottom-left, px) */
+  float prev_x, prev_y;     /* previous frame's position (delta source)    */
+  int32_t phase;            /* TouchPhase: 0 Began 1 Moved 2 Stat 3 Ended  */
+} HookTouch;
+static HookTouch s_touches[NX_HOOK_MAX_TOUCHES];
+static int s_count = 0;     /* slots presented this frame (active + Ended) */
+
+int   g_hook_count = 0;                 /* Input.touchCount (active + Ended frame)     */
+int   g_hook_btn   = 0;                 /* Input.GetMouseButton(0), follows touch 0    */
 int   g_hook_btn_down = 0, g_hook_btn_up = 0;  /* GetMouseButtonDown/Up(0), 1-frame edges */
-int   g_hook_phase = 3;                 /* TouchPhase: 0 Began 1 Moved 2 Stat 3 Ended    */
-float g_hook_x = 0.0f, g_hook_y = 0.0f; /* Unity screen space (bottom-left origin, px)   */
+int   g_hook_phase = 3;                 /* TouchPhase of touch 0, for legacy readers   */
+float g_hook_x = 0.0f, g_hook_y = 0.0f; /* Unity screen space of touch 0, kept on lift */
 
 /* ---- Unity value types (AArch64 return conventions matter) ---------------- */
 typedef struct { float x, y; }    NxV2;
@@ -46,10 +59,14 @@ static uint8_t hk_getMouseButtonDown(int32_t b, void *mi){ (void)mi; return (b==
 static uint8_t hk_getMouseButtonUp(int32_t b, void *mi){ (void)mi; return (b==0) ? (uint8_t)g_hook_btn_up : 0; }
 static NxTouch hk_getTouch(int32_t index, void *mi){
   (void)mi; NxTouch t; memset(&t, 0, sizeof t);
-  if (index == 0) {
-    t.m_Position.x = g_hook_x; t.m_Position.y = g_hook_y;
+  if (index >= 0 && index < s_count) {
+    const HookTouch *h = &s_touches[index];
+    t.m_FingerId = h->finger_id;
+    t.m_Position.x = h->x; t.m_Position.y = h->y;
     t.m_RawPosition = t.m_Position;
-    t.m_Phase = g_hook_phase; t.m_TapCount = 1;
+    t.m_PositionDelta.x = (h->phase == 3) ? 0.0f : h->x - h->prev_x;
+    t.m_PositionDelta.y = (h->phase == 3) ? 0.0f : h->y - h->prev_y;
+    t.m_Phase = h->phase; t.m_TapCount = 1;
     t.m_Pressure = 1.0f; t.m_maxPressure = 1.0f;
   }
   return t;
@@ -93,23 +110,73 @@ void nx_install_language_hook(uintptr_t il2cpp_base) {
   patch_jump(il2cpp_base + RVA_getCurrentLanguage, (void *)hk_getCurrentLanguage);
 }
 
-/* Called by android_native_feed_hid with the current touch, already mapped to Unity screen
- * space (bottom-left origin, game pixels). active=1 while a finger is down; the release frame
- * is reported once as phase Ended (count still 1) so EZGUI sees the tap complete. */
-void nx_input_hook_update(int active, float ux, float uy) {
-  static int prev = 0;
-  g_hook_btn_down = (active && !prev);
-  g_hook_btn_up   = (!active && prev);
-  if (active) {
-    g_hook_count = 1; g_hook_btn = 1;
-    g_hook_x = ux; g_hook_y = uy;
-    g_hook_phase = prev ? 1 /*Moved*/ : 0 /*Began*/;
-  } else if (prev) {                     /* release: one Ended frame at the last position */
-    g_hook_count = 1; g_hook_btn = 0; g_hook_phase = 3 /*Ended*/;
-  } else {
-    g_hook_count = 0; g_hook_btn = 0; g_hook_phase = 3;
+/* Called by android_native_feed_hid with the current touches, already mapped
+ * to Unity screen space (bottom-left origin, game pixels). A finger present
+ * this frame keeps Began (first frame) / Moved / Stationary; a finger that
+ * was present last frame but is absent now is reported once as Ended (count
+ * still includes it, so EZGUI sees the tap/drag complete), then dropped. */
+void nx_input_hook_update_multi(int count, const int32_t *ids,
+                                const float *xs, const float *ys) {
+  HookTouch next[NX_HOOK_MAX_TOUCHES];
+  int n = 0;
+  if (count < 0) count = 0;
+  if (count > NX_HOOK_MAX_TOUCHES) count = NX_HOOK_MAX_TOUCHES;
+
+  /* Continuing + new fingers, in caller order (finger 0 stays first). */
+  for (int i = 0; i < count; i++) {
+    HookTouch *t = &next[n++];
+    t->finger_id = ids[i];
+    t->x = xs[i]; t->y = ys[i];
+    int prev_idx = -1;
+    for (int j = 0; j < s_count; j++) {
+      if (s_touches[j].finger_id == ids[i] && s_touches[j].phase != 3) { prev_idx = j; break; }
+    }
+    if (prev_idx >= 0) {
+      t->prev_x = s_touches[prev_idx].x; t->prev_y = s_touches[prev_idx].y;
+      t->phase = (t->x == t->prev_x && t->y == t->prev_y) ? 2 /*Stationary*/ : 1 /*Moved*/;
+    } else {
+      t->prev_x = t->x; t->prev_y = t->y;
+      t->phase = 0 /*Began*/;
+    }
   }
-  prev = active;
+  /* Lifted fingers: one Ended frame at their last position (if room). */
+  for (int j = 0; j < s_count && n < NX_HOOK_MAX_TOUCHES; j++) {
+    if (s_touches[j].phase == 3) continue;   /* already in its Ended frame: drop */
+    int still_down = 0;
+    for (int i = 0; i < count; i++) {
+      if (ids[i] == s_touches[j].finger_id) { still_down = 1; break; }
+    }
+    if (!still_down) {
+      HookTouch *t = &next[n++];
+      *t = s_touches[j];
+      t->prev_x = t->x; t->prev_y = t->y;   /* Ended delta reads as 0 */
+      t->phase = 3 /*Ended*/;
+    }
+  }
+
+  for (int i = 0; i < n; i++) s_touches[i] = next[i];
+  s_count = n;
+  g_hook_count = n;
+  /* Mouse / legacy single-touch readers follow touch 0; on a full lift the
+   * last position is kept (old behaviour) instead of snapping to 0,0. */
+  if (n > 0) {
+    g_hook_x = s_touches[0].x; g_hook_y = s_touches[0].y;
+    g_hook_phase = s_touches[0].phase;
+    g_hook_btn = (s_touches[0].phase != 3);
+    g_hook_btn_down = (s_touches[0].phase == 0);
+    g_hook_btn_up = (s_touches[0].phase == 3);
+  } else {
+    g_hook_btn = 0; g_hook_btn_down = 0; g_hook_btn_up = 0; g_hook_phase = 3;
+  }
+}
+
+void nx_input_hook_update(int active, float ux, float uy) {
+  if (active) {
+    int32_t id = 0;
+    nx_input_hook_update_multi(1, &id, &ux, &uy);
+  } else {
+    nx_input_hook_update_multi(0, NULL, NULL, NULL);
+  }
 }
 
 /* ---- PlayerPrefs persistence ---------------------------------------------
