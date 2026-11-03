@@ -19,10 +19,10 @@ void nx_install_playerprefs_hooks(uintptr_t il2cpp_base, void *string_new);
 
 /* Push the current touches (Unity screen space, bottom-left origin, px) each
  * frame. count is clamped to NX_HOOK_MAX_TOUCHES; ids are Unity fingerIds
- * (handheld: the HID finger_id, docked: 0 = stick cursor, 1 = ZR second
- * finger). A finger absent from this frame's list after being present is
- * reported once with phase Ended, then dropped, matching Unity semantics and
- * the old single-touch behaviour. */
+ * (real fingers: the HID finger_id; virtual stick fingers: 1000 = cursor,
+ * 1001 = ZR second finger). A finger absent from this frame's list after
+ * being present is reported once with phase Ended, then dropped, matching
+ * Unity semantics and the old single-touch behaviour. */
 void nx_input_hook_update_multi(int count, const int32_t *ids,
                                 const float *xs, const float *ys);
 

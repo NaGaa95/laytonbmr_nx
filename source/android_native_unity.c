@@ -217,9 +217,13 @@ void android_get_orientation(float *x, float *y, float *z){
  * (PORTING_PLAN.md S4) and fill in feed_one_touch(). Until then this reads HID
  * but doesn't yet hand it to the engine.
  * ========================================================================== */
-/* HID -> Unity input. Handheld: touchscreen passes straight through. Docked (no touch): the
- * left stick drives a virtual cursor (drawn by imports.c), A = tap. Touch is fed into il2cpp
- * UnityEngine.Input via the hooks in unity_input_hook.c. */
+/* HID -> Unity input. Touch is fed into il2cpp UnityEngine.Input via the
+ * hooks in unity_input_hook.c. Real touchscreen fingers and the stick-driven
+ * virtual cursor are merged into ONE touch list every frame (real fingers
+ * first, then virtual), so they can combine: one real finger + A on the stick
+ * is already two touches, and A + ZR on the stick is two virtual touches.
+ * Previously the stick path only ran when NO real finger was down, so in
+ * handheld the second pointer could never appear alongside a real touch. */
 
 static PadState g_pad;
 static HidTouchScreenState g_touch;
@@ -228,9 +232,11 @@ static int   g_cursor_activity = 0;               /* frames left to keep the cur
 
 /* Virtual-cursor state consumed by the GL overlay (imports.c). Same 1920x1080 bottom-left
  * screen space the touch is injected in, so the drawn dot lands exactly where A taps.
- * The second cursor is the docked two-finger partner (ZR held): same position as
- * the main cursor plus a fixed offset, so a stick drag moves both touches together
- * exactly like a two-finger slide on a touchscreen. */
+ * The second cursor is the two-finger partner (ZR held, docked or handheld):
+ * same position as the main cursor plus a fixed offset, so a stick drag moves
+ * both touches together exactly like a two-finger slide on a touchscreen.
+ * Virtual fingerIds are 1000/1001, far from HID fingerIds, so a virtual
+ * finger can never be mistaken for a real finger by the hook's id matching. */
 int   nx_cursor_show = 0;
 float nx_cursor_x = 960.0f, nx_cursor_y = 540.0f;
 int   nx_cursor2_show = 0;
@@ -250,7 +256,26 @@ void android_native_feed_hid(void){
   float xs[NX_HOOK_MAX_TOUCHES], ys[NX_HOOK_MAX_TOUCHES];
   int count = 0;
 
-  /* ---- handheld touchscreen (primary): every finger, not just touches[0] ---- */
+  /* ---- stick cursor: always updated, in every mode ---- */
+  HidAnalogStickState ls = padGetStickPos(&g_pad, 0);
+  int dx = ls.x, dy = ls.y;
+  int moved = (dx > 3200 || dx < -3200 || dy > 3200 || dy < -3200);   /* ~10% deadzone kills drift */
+  if (moved) {
+    g_cursor_x += (dx / 32767.0f) * 34.0f;
+    g_cursor_y += (dy / 32767.0f) * 34.0f;            /* stick up -> +Y (Unity up) */
+    if (g_cursor_x < 0) g_cursor_x = 0; else if (g_cursor_x > screen_width)  g_cursor_x = screen_width;
+    if (g_cursor_y < 0) g_cursor_y = 0; else if (g_cursor_y > screen_height) g_cursor_y = screen_height;
+  }
+  uint64_t buttons = padGetButtons(&g_pad);
+  int a_held = (buttons & HidNpadButton_A) != 0;
+  int zr_held = (buttons & HidNpadButton_ZR) != 0;
+  /* Second finger: to the right of the cursor, or to the left when the
+   * cursor is too close to the right edge to keep the two points apart. */
+  float x2 = g_cursor_x + NX_DUAL_OFFSET_PX;
+  if (x2 > (float)screen_width) x2 = g_cursor_x - NX_DUAL_OFFSET_PX;
+  if (x2 < 0) x2 = 0;
+
+  /* ---- real touchscreen fingers first (handheld) ---- */
   int n = hidGetTouchScreenStates(&g_touch, 1);
   if (n > 0 && g_touch.count > 0){
     count = g_touch.count;
@@ -261,48 +286,34 @@ void android_native_feed_hid(void){
       xs[i] = px * ((float)screen_width  / PANEL_W);
       ys[i] = (float)screen_height - py * ((float)screen_height / PANEL_H);   /* flip Y: Unity is bottom-left */
     }
-    nx_cursor_show = 0;                       /* finger is the pointer -> hide the stick cursor */
-    nx_cursor2_show = 0;
-  } else {
-    /* ---- left stick drives a virtual cursor, A = tap (the only input when docked) ----
-     * Hold ZR as well and a second virtual finger appears at a fixed offset from
-     * the cursor, moving with it: A + ZR + stick drag == a two-finger slide
-     * (the case-7 room-move gesture). ZR is held, never toggled, so single-touch
-     * behaviour is unchanged the moment it is released. */
-    HidAnalogStickState ls = padGetStickPos(&g_pad, 0);
-    int dx = ls.x, dy = ls.y;
-    int moved = (dx > 3200 || dx < -3200 || dy > 3200 || dy < -3200);   /* ~10% deadzone kills drift */
-    if (moved) {
-      g_cursor_x += (dx / 32767.0f) * 34.0f;
-      g_cursor_y += (dy / 32767.0f) * 34.0f;            /* stick up -> +Y (Unity up) */
-      if (g_cursor_x < 0) g_cursor_x = 0; else if (g_cursor_x > screen_width)  g_cursor_x = screen_width;
-      if (g_cursor_y < 0) g_cursor_y = 0; else if (g_cursor_y > screen_height) g_cursor_y = screen_height;
-    }
-    uint64_t buttons = padGetButtons(&g_pad);
-    int a_held = (buttons & HidNpadButton_A) != 0;
-    int zr_held = (buttons & HidNpadButton_ZR) != 0;
-    /* Second finger: to the right of the cursor, or to the left when the
-     * cursor is too close to the right edge to keep the two points apart. */
-    float x2 = g_cursor_x + NX_DUAL_OFFSET_PX;
-    if (x2 > (float)screen_width) x2 = g_cursor_x - NX_DUAL_OFFSET_PX;
-    if (x2 < 0) x2 = 0;
-    if (a_held) {
-      ids[0] = 0; xs[0] = g_cursor_x; ys[0] = g_cursor_y; count = 1;
-      if (zr_held) { ids[1] = 1; xs[1] = x2; ys[1] = g_cursor_y; count = 2; }
-    }
-
-    /* Cursor is always visible docked (no touch panel); in handheld it appears only
-     * while the stick/A is in use (~3s after) so it never clutters touch play. */
-    int docked = (appletGetOperationMode() == AppletOperationMode_Console);
-    if (moved || a_held || zr_held) g_cursor_activity = 180;       /* ~3s @ 60fps */
-    else if (g_cursor_activity > 0) g_cursor_activity--;
-    nx_cursor_show  = (docked || g_cursor_activity > 0);
-    nx_cursor_x     = g_cursor_x;
-    nx_cursor_y     = g_cursor_y;
-    nx_cursor2_show = zr_held && (docked || g_cursor_activity > 0);
-    nx_cursor2_x    = x2;
-    nx_cursor2_y    = g_cursor_y;
   }
+
+  /* ---- virtual stick fingers appended after the real ones ----
+   * A = one virtual finger at the cursor; A + ZR = two virtual fingers
+   * moving together (the case-7 two-finger slide). ZR is held, never
+   * toggled, so single-touch behaviour is unchanged the moment it is
+   * released. In handheld this is what makes a second pointer possible
+   * alongside a real finger: real finger + A == 2 touches, real finger +
+   * A + ZR == 3 touches (game only needs 2). */
+  if (a_held && count < NX_HOOK_MAX_TOUCHES) {
+    ids[count] = 1000; xs[count] = g_cursor_x; ys[count] = g_cursor_y; count++;
+    if (zr_held && count < NX_HOOK_MAX_TOUCHES) {
+      ids[count] = 1001; xs[count] = x2; ys[count] = g_cursor_y; count++;
+    }
+  }
+
+  /* Cursor is always visible docked (no touch panel); in handheld it appears
+   * while the stick/A/ZR is in use (~3s after) so it never clutters pure
+   * touch play, but it IS visible while a virtual finger is being used. */
+  int docked = (appletGetOperationMode() == AppletOperationMode_Console);
+  if (moved || a_held || zr_held) g_cursor_activity = 180;       /* ~3s @ 60fps */
+  else if (g_cursor_activity > 0) g_cursor_activity--;
+  nx_cursor_show  = (docked || g_cursor_activity > 0);
+  nx_cursor_x     = g_cursor_x;
+  nx_cursor_y     = g_cursor_y;
+  nx_cursor2_show = zr_held && (docked || g_cursor_activity > 0);
+  nx_cursor2_x    = x2;
+  nx_cursor2_y    = g_cursor_y;
 
   nx_input_hook_update_multi(count, ids, xs, ys);
 }
