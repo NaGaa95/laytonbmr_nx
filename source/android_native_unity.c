@@ -290,6 +290,8 @@ void android_native_feed_hid(void){
     }
   }
 
+  int real_count = count;   /* real fingers only, before virtual ones are appended (diagnostic log below) */
+
   /* ---- virtual stick fingers appended after the real ones ----
    * No real finger is needed at all, handheld or docked:
    * - ZR held (with or without A) = TWO virtual fingers, at the cursor
@@ -325,6 +327,27 @@ void android_native_feed_hid(void){
   nx_cursor2_show = zr_held && (docked || g_cursor_activity > 0);
   nx_cursor2_x    = x2;
   nx_cursor2_y    = g_cursor_y;
+
+  /* DIAGNOSTIC (temporary, build #4): log what the wrapper actually sees,
+   * once a second plus on every ZR press/release, to sdmc:/switch/
+   * laytonbmr_nx/debug.log. This settles, from hardware evidence, whether
+   * (a) the ZR bit never arrives from the pad, (b) ZR arrives but the
+   * second touch/dot is not produced, or (c) both touches are produced
+   * and the game itself ignores the virtual pair. Game behaviour is
+   * unchanged: this only writes log lines. */
+  {
+    static int s_diag_frame = 0, s_diag_prev_zr = 0;
+    s_diag_frame++;
+    if ((s_diag_frame % 60) == 0 || zr_held != s_diag_prev_zr) {
+      debugPrintf("[dual] frame=%d btn=0x%llx a=%d zr=%d handheld=%d conn=%d docked=%d real=%d total=%d ids=%d,%d,%d cur=(%.0f,%.0f) cur2=(%.0f,%.0f) show=%d/%d\n",
+        s_diag_frame, (unsigned long long)buttons, a_held, zr_held,
+        padIsHandheld(&g_pad) ? 1 : 0, padIsConnected(&g_pad) ? 1 : 0, docked,
+        real_count, count,
+        count > 0 ? (int)ids[0] : -1, count > 1 ? (int)ids[1] : -1, count > 2 ? (int)ids[2] : -1,
+        g_cursor_x, g_cursor_y, x2, g_cursor_y, nx_cursor_show, nx_cursor2_show);
+    }
+    s_diag_prev_zr = zr_held;
+  }
 
   nx_input_hook_update_multi(count, ids, xs, ys);
 }

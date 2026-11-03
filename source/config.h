@@ -51,7 +51,9 @@
 #define GAME_HOME   "sdmc:/switch/laytonbmr_nx"
 
 // flip to 1 (and rebuild) for on-hardware file logging (debug.log)
-#define DEBUG_LOG 0
+// DIAGNOSTIC build #4: temporarily 1 so the [dual] feed log is written;
+// flip back to 0 for the next non-diagnostic build.
+#define DEBUG_LOG 1
 
 extern int screen_width;
 extern int screen_height;
