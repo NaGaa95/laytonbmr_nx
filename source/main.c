@@ -22,6 +22,7 @@
  * Heap + syscall scaffolding inherited from the vln/cr3_nx base (MIT).
  */
 
+#include "saltynx.h"
 #include <stdlib.h>
 #include <malloc.h>
 #include <string.h>
@@ -593,6 +594,8 @@ static void nx_try_grant_offline_dlc(void) {
 #endif
 
 int main(int argc, char *argv[]) {
+  saltynx_start();
+  atexit(saltynx_stop);
   (void)argc; (void)argv;
   socketInitializeDefault();
   debugPrintf("[boot] === laytonbmr_nx start (Unity 6000.0.58f2, build v1) ===\n");
