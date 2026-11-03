@@ -221,9 +221,11 @@ void android_get_orientation(float *x, float *y, float *z){
  * hooks in unity_input_hook.c. Real touchscreen fingers and the stick-driven
  * virtual cursor are merged into ONE touch list every frame (real fingers
  * first, then virtual), so they can combine: one real finger + A on the stick
- * is already two touches, and A + ZR on the stick is two virtual touches.
+ * is already two touches, and ZR on the stick alone is two virtual touches
+ * (no real finger needed at all, handheld or docked).
  * Previously the stick path only ran when NO real finger was down, so in
- * handheld the second pointer could never appear alongside a real touch. */
+ * handheld the second pointer could never appear alongside a real touch,
+ * and ZR alone produced no touch at all. */
 
 static PadState g_pad;
 static HidTouchScreenState g_touch;
@@ -289,17 +291,26 @@ void android_native_feed_hid(void){
   }
 
   /* ---- virtual stick fingers appended after the real ones ----
-   * A = one virtual finger at the cursor; A + ZR = two virtual fingers
-   * moving together (the case-7 two-finger slide). ZR is held, never
-   * toggled, so single-touch behaviour is unchanged the moment it is
-   * released. In handheld this is what makes a second pointer possible
-   * alongside a real finger: real finger + A == 2 touches, real finger +
-   * A + ZR == 3 touches (game only needs 2). */
-  if (a_held && count < NX_HOOK_MAX_TOUCHES) {
-    ids[count] = 1000; xs[count] = g_cursor_x; ys[count] = g_cursor_y; count++;
-    if (zr_held && count < NX_HOOK_MAX_TOUCHES) {
+   * No real finger is needed at all, handheld or docked:
+   * - ZR held (with or without A) = TWO virtual fingers, at the cursor
+   *   and at cursor+offset, moving together with the stick: exactly the
+   *   case-7 two-finger slide, played fully virtually.
+   * - A held alone = one virtual finger at the cursor (single tap).
+   * ZR is held, never toggled, so behaviour is unchanged the moment it
+   * is released. Previously ZR alone produced no touch at all (only its
+   * dot), so a ZR + stick slide did nothing in-game and the second
+   * pointer seemed absent when playing without touching the screen.
+   * Hybrid still works too: real finger + A == 2 touches, real finger +
+   * ZR == 3 touches (game only needs 2). */
+  if (zr_held) {
+    if (count < NX_HOOK_MAX_TOUCHES) {
+      ids[count] = 1000; xs[count] = g_cursor_x; ys[count] = g_cursor_y; count++;
+    }
+    if (count < NX_HOOK_MAX_TOUCHES) {
       ids[count] = 1001; xs[count] = x2; ys[count] = g_cursor_y; count++;
     }
+  } else if (a_held && count < NX_HOOK_MAX_TOUCHES) {
+    ids[count] = 1000; xs[count] = g_cursor_x; ys[count] = g_cursor_y; count++;
   }
 
   /* Cursor is always visible docked (no touch panel); in handheld it appears
