@@ -243,7 +243,9 @@ int   nx_cursor_show = 0;
 float nx_cursor_x = 960.0f, nx_cursor_y = 540.0f;
 int   nx_cursor2_show = 0;
 float nx_cursor2_x = 1120.0f, nx_cursor2_y = 540.0f;
-#define NX_DUAL_OFFSET_PX 160.0f   /* separation of the docked second finger */
+#define NX_DUAL_OFFSET_PX 160.0f   /* separation of the virtual finger pair */
+static int g_dual_active = 0;
+static float g_dual_offset = NX_DUAL_OFFSET_PX;
 
 void android_native_input_init(void){
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
@@ -258,6 +260,19 @@ void android_native_feed_hid(void){
   float xs[NX_HOOK_MAX_TOUCHES], ys[NX_HOOK_MAX_TOUCHES];
   int count = 0;
 
+  uint64_t buttons = padGetButtons(&g_pad);
+  int a_held = (buttons & HidNpadButton_A) != 0;
+  int zr_held = (buttons & HidNpadButton_ZR) != 0;
+  /* Pick a side once when ZR is pressed. Flipping sides during a drag would
+   * teleport the second finger by twice the separation. */
+  if (zr_held && !g_dual_active) {
+    float separation = (float)screen_width < NX_DUAL_OFFSET_PX
+                     ? (float)screen_width : NX_DUAL_OFFSET_PX;
+    g_dual_offset = g_cursor_x + separation > (float)screen_width
+                  ? -separation : separation;
+  }
+  g_dual_active = zr_held;
+
   /* ---- stick cursor: always updated, in every mode ---- */
   HidAnalogStickState ls = padGetStickPos(&g_pad, 0);
   int dx = ls.x, dy = ls.y;
@@ -265,17 +280,13 @@ void android_native_feed_hid(void){
   if (moved) {
     g_cursor_x += (dx / 32767.0f) * 34.0f;
     g_cursor_y += (dy / 32767.0f) * 34.0f;            /* stick up -> +Y (Unity up) */
-    if (g_cursor_x < 0) g_cursor_x = 0; else if (g_cursor_x > screen_width)  g_cursor_x = screen_width;
-    if (g_cursor_y < 0) g_cursor_y = 0; else if (g_cursor_y > screen_height) g_cursor_y = screen_height;
   }
-  uint64_t buttons = padGetButtons(&g_pad);
-  int a_held = (buttons & HidNpadButton_A) != 0;
-  int zr_held = (buttons & HidNpadButton_ZR) != 0;
-  /* Second finger: to the right of the cursor, or to the left when the
-   * cursor is too close to the right edge to keep the two points apart. */
-  float x2 = g_cursor_x + NX_DUAL_OFFSET_PX;
-  if (x2 > (float)screen_width) x2 = g_cursor_x - NX_DUAL_OFFSET_PX;
-  if (x2 < 0) x2 = 0;
+  /* Clamp the pair as a group, preserving its offset at either screen edge. */
+  float min_x = zr_held && g_dual_offset < 0 ? -g_dual_offset : 0;
+  float max_x = (float)screen_width - (zr_held && g_dual_offset > 0 ? g_dual_offset : 0);
+  if (g_cursor_x < min_x) g_cursor_x = min_x; else if (g_cursor_x > max_x) g_cursor_x = max_x;
+  if (g_cursor_y < 0) g_cursor_y = 0; else if (g_cursor_y > screen_height) g_cursor_y = screen_height;
+  float x2 = g_cursor_x + g_dual_offset;
 
   /* ---- real touchscreen fingers first (handheld) ---- */
   int n = hidGetTouchScreenStates(&g_touch, 1);

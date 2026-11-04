@@ -22,7 +22,10 @@ void nx_install_playerprefs_hooks(uintptr_t il2cpp_base, void *string_new);
  * (real fingers: the HID finger_id; virtual stick fingers: 1000 = cursor,
  * 1001 = ZR second finger). A finger absent from this frame's list after
  * being present is reported once with phase Ended, then dropped, matching
- * Unity semantics and the old single-touch behaviour. */
+ * Unity semantics and the old single-touch behaviour. At capacity, new
+ * fingers are deferred until continuing fingers and release events fit.
+ * Mouse emulation follows the first finger by ID; after it lifts, another
+ * click can start only after all fingers have lifted. */
 void nx_input_hook_update_multi(int count, const int32_t *ids,
                                 const float *xs, const float *ys);
 

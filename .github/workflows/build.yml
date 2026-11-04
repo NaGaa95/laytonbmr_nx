@@ -42,7 +42,7 @@ jobs:
           export DEVKITPRO=/opt/devkitpro
           make clean
           make -j$(nproc)
-          ls -lh laytonbmr_nx.nro laytonbmr_nx.elf
+          ls -lh laytonbmr_nx.nro laytonbmr_nx.elf build/laytonbmr_nx.map
 
       - name: Upload NRO
         uses: actions/upload-artifact@v4
@@ -56,5 +56,5 @@ jobs:
           name: laytonbmr_nx-elf-map
           path: |
             laytonbmr_nx.elf
-            laytonbmr_nx.map
+            build/laytonbmr_nx.map
           if-no-files-found: warn

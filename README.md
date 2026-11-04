@@ -51,6 +51,10 @@ devkitA64 plus these portlibs:
 pacman -S switch-mesa switch-libdrm_nouveau switch-sdl2 switch-zlib
 ```
 
+Input regression tests can run on a host with Python 3 and a C compiler:
+`python3 tests/run_input_tests.py` (or pass `--cc clang` / `--cc gcc`).
+They exercise the actual touch hook and HID feed with mocked libnx input.
+
 ## Credits
 
 * **TheOfficialFloW** — the original Android so-loader (gtasa_vita).

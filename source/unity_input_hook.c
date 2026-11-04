@@ -34,12 +34,17 @@ typedef struct {
 } HookTouch;
 static HookTouch s_touches[NX_HOOK_MAX_TOUCHES];
 static int s_count = 0;     /* slots presented this frame (active + Ended) */
+/* Mouse emulation owns the first finger for the whole gesture. After that
+ * finger lifts, wait for all fingers to lift before starting another click. */
+enum { MOUSE_IDLE, MOUSE_TRACKING, MOUSE_WAIT_CLEAR };
+static int s_mouse_state = MOUSE_IDLE;
+static int32_t s_mouse_finger_id;
 
 int   g_hook_count = 0;                 /* Input.touchCount (active + Ended frame)     */
-int   g_hook_btn   = 0;                 /* Input.GetMouseButton(0), follows touch 0    */
+int   g_hook_btn   = 0;                 /* Input.GetMouseButton(0), primary finger    */
 int   g_hook_btn_down = 0, g_hook_btn_up = 0;  /* GetMouseButtonDown/Up(0), 1-frame edges */
-int   g_hook_phase = 3;                 /* TouchPhase of touch 0, for legacy readers   */
-float g_hook_x = 0.0f, g_hook_y = 0.0f; /* Unity screen space of touch 0, kept on lift */
+int   g_hook_phase = 3;                 /* Primary mouse finger's TouchPhase          */
+float g_hook_x = 0.0f, g_hook_y = 0.0f; /* Mouse position, kept on primary lift       */
 
 /* ---- Unity value types (AArch64 return conventions matter) ---------------- */
 typedef struct { float x, y; }    NxV2;
@@ -122,15 +127,26 @@ void nx_input_hook_update_multi(int count, const int32_t *ids,
   if (count < 0) count = 0;
   if (count > NX_HOOK_MAX_TOUCHES) count = NX_HOOK_MAX_TOUCHES;
 
-  /* Continuing + new fingers, in caller order (finger 0 stays first). */
+  /* Every previously active finger needs a slot, either continuing or Ended.
+   * Reserve those slots before admitting new fingers. At capacity, a new
+   * finger can begin next frame, after the old Ended slots are dropped. */
+  int new_slots = NX_HOOK_MAX_TOUCHES;
+  for (int j = 0; j < s_count; j++)
+    if (s_touches[j].phase != 3) new_slots--;
+
+  /* Continuing + admitted new fingers, in caller order. */
   for (int i = 0; i < count; i++) {
-    HookTouch *t = &next[n++];
-    t->finger_id = ids[i];
-    t->x = xs[i]; t->y = ys[i];
     int prev_idx = -1;
     for (int j = 0; j < s_count; j++) {
       if (s_touches[j].finger_id == ids[i] && s_touches[j].phase != 3) { prev_idx = j; break; }
     }
+    if (prev_idx < 0) {
+      if (new_slots == 0) continue;
+      new_slots--;
+    }
+    HookTouch *t = &next[n++];
+    t->finger_id = ids[i];
+    t->x = xs[i]; t->y = ys[i];
     if (prev_idx >= 0) {
       t->prev_x = s_touches[prev_idx].x; t->prev_y = s_touches[prev_idx].y;
       t->phase = (t->x == t->prev_x && t->y == t->prev_y) ? 2 /*Stationary*/ : 1 /*Moved*/;
@@ -139,7 +155,8 @@ void nx_input_hook_update_multi(int count, const int32_t *ids,
       t->phase = 0 /*Began*/;
     }
   }
-  /* Lifted fingers: one Ended frame at their last position (if room). */
+  const int active_count = n;
+  /* Lifted fingers: the slots reserved above guarantee one Ended frame. */
   for (int j = 0; j < s_count && n < NX_HOOK_MAX_TOUCHES; j++) {
     if (s_touches[j].phase == 3) continue;   /* already in its Ended frame: drop */
     int still_down = 0;
@@ -157,17 +174,30 @@ void nx_input_hook_update_multi(int count, const int32_t *ids,
   for (int i = 0; i < n; i++) s_touches[i] = next[i];
   s_count = n;
   g_hook_count = n;
-  /* Mouse / legacy single-touch readers follow touch 0; on a full lift the
-   * last position is kept (old behaviour) instead of snapping to 0,0. */
-  if (n > 0) {
-    g_hook_x = s_touches[0].x; g_hook_y = s_touches[0].y;
-    g_hook_phase = s_touches[0].phase;
-    g_hook_btn = (s_touches[0].phase != 3);
-    g_hook_btn_down = (s_touches[0].phase == 0);
-    g_hook_btn_up = (s_touches[0].phase == 3);
-  } else {
-    g_hook_btn = 0; g_hook_btn_down = 0; g_hook_btn_up = 0; g_hook_phase = 3;
+  /* Mouse edges depend on the owned finger, never on touch-list ordering.
+   * In particular, adding a real finger while A is held must not start a
+   * second click or teleport the mouse to that finger. */
+  const int was_down = g_hook_btn;
+  g_hook_btn = 0;
+  g_hook_phase = 3;
+  if (s_mouse_state == MOUSE_IDLE && active_count > 0) {
+    s_mouse_finger_id = s_touches[0].finger_id;
+    s_mouse_state = MOUSE_TRACKING;
   }
+  if (s_mouse_state == MOUSE_TRACKING) {
+    s_mouse_state = MOUSE_WAIT_CLEAR;
+    for (int i = 0; i < active_count; i++) {
+      if (s_touches[i].finger_id != s_mouse_finger_id) continue;
+      g_hook_x = s_touches[i].x; g_hook_y = s_touches[i].y;
+      g_hook_phase = s_touches[i].phase;
+      g_hook_btn = 1;
+      s_mouse_state = MOUSE_TRACKING;
+      break;
+    }
+  }
+  g_hook_btn_down = g_hook_btn && !was_down;
+  g_hook_btn_up = !g_hook_btn && was_down;
+  if (count == 0) s_mouse_state = MOUSE_IDLE;
 }
 
 void nx_input_hook_update(int active, float ux, float uy) {
