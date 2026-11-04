@@ -572,6 +572,8 @@ static EGLBoolean egl_DestroySurface_keep(EGLDisplay d, EGLSurface s) {
  * bottom-left screen space the touch is injected -- so it sits exactly where A taps. */
 extern int   nx_cursor_show;   /* android_native_unity.c */
 extern float nx_cursor_x, nx_cursor_y;
+extern int   nx_cursor2_show;  /* docked two-finger partner (ZR held) */
+extern float nx_cursor2_x, nx_cursor2_y;
 
 static GLuint nx_compile_shader(GLenum type, const char *src) {
   GLuint s = glCreateShader(type);
@@ -590,8 +592,7 @@ static GLuint nx_link_program(const char *vs, const char *fs) {
 }
 static struct { GLuint prog; GLint loc_pos, loc_local, loc_feather; int ready; } nx_cur;
 
-static void draw_nx_cursor(void){
-  if (!nx_cursor_show) return;
+static void draw_nx_cursor_at(float cursor_x_px, float cursor_y_px, float radius_scale){
   const int W = screen_width  > 0 ? screen_width  : 1920;
   const int H = screen_height > 0 ? screen_height : 1080;
   if (!nx_cur.ready) {
@@ -615,9 +616,9 @@ static void draw_nx_cursor(void){
   }
   if (!nx_cur.prog) return;
 
-  const float r  = 18.0f * ((float)(W > H ? W : H) / 1280.0f);   /* constant on-screen size */
-  const float cx = (nx_cursor_x / (float)W) * 2.0f - 1.0f;
-  const float cy = (nx_cursor_y / (float)H) * 2.0f - 1.0f;       /* bottom-left origin: no Y flip */
+  const float r  = 18.0f * ((float)(W > H ? W : H) / 1280.0f) * radius_scale;   /* constant on-screen size */
+  const float cx = (cursor_x_px / (float)W) * 2.0f - 1.0f;
+  const float cy = (cursor_y_px / (float)H) * 2.0f - 1.0f;       /* bottom-left origin: no Y flip */
   const float rx = r / (float)W * 2.0f, ry = r / (float)H * 2.0f;
   const GLfloat pos[8]   = { cx-rx,cy-ry,  cx+rx,cy-ry,  cx-rx,cy+ry,  cx+rx,cy+ry };
   static const GLfloat local[8] = { -1,-1,  1,-1,  -1,1,  1,1 };
@@ -662,6 +663,11 @@ static void draw_nx_cursor(void){
   if (p_depth)   glEnable(GL_DEPTH_TEST);
   if (p_scissor) glEnable(GL_SCISSOR_TEST);
   if (p_cull)    glEnable(GL_CULL_FACE);
+}
+
+static void draw_nx_cursor(void){
+  if (nx_cursor_show) draw_nx_cursor_at(nx_cursor_x, nx_cursor_y, 1.0f);
+  if (nx_cursor2_show) draw_nx_cursor_at(nx_cursor2_x, nx_cursor2_y, 0.7f);   /* smaller partner dot */
 }
 
 static EGLBoolean egl_SwapBuffers_log(EGLDisplay d, EGLSurface s) {

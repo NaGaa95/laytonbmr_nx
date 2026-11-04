@@ -1,0 +1,60 @@
+name: Build laytonbmr_nx NRO
+
+# Manual only, sama seperti workflow aota_nx: tidak jalan otomatis saat push.
+# Jalankan dari tab Actions repo ini ("Run workflow") setelah ada perubahan
+# yang mau dites. Jangan umumkan build berjalan sebelum trigger terkonfirmasi.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container:
+      image: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          # Tanpa -Syu (full upgrade) supaya versi toolchain tetap seperti
+          # yang dibundel di image; cukup instal portlib yang dibutuhkan
+          # Makefile (lihat README): switch-mesa, switch-libdrm_nouveau,
+          # switch-sdl2, switch-zlib, plus switch-tools untuk elf2nro/nacp.
+          # Retry loop untuk handle transient 403 dari mirror devkitPro.
+          for i in 1 2 3; do
+            echo "Attempt $i/3: installing dependencies..."
+            if dkp-pacman -S --noconfirm --needed \
+              switch-mesa switch-libdrm_nouveau switch-sdl2 switch-zlib \
+              switch-tools; then
+              echo "Dependencies installed successfully."
+              break
+            fi
+            echo "Attempt $i failed, waiting 10s before retry..."
+            sleep 10
+            if [ $i -eq 3 ]; then
+              echo "All retries failed."
+              exit 1
+            fi
+          done
+
+      - name: Build
+        run: |
+          export DEVKITPRO=/opt/devkitpro
+          make clean
+          make -j$(nproc)
+          ls -lh laytonbmr_nx.nro laytonbmr_nx.elf build/laytonbmr_nx.map
+
+      - name: Upload NRO
+        uses: actions/upload-artifact@v4
+        with:
+          name: laytonbmr_nx-nro
+          path: laytonbmr_nx.nro
+
+      - name: Upload ELF and link map
+        uses: actions/upload-artifact@v4
+        with:
+          name: laytonbmr_nx-elf-map
+          path: |
+            laytonbmr_nx.elf
+            build/laytonbmr_nx.map
+          if-no-files-found: warn

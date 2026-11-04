@@ -21,12 +21,30 @@ int   debugPrintf(char *fmt, ...);
 extern int screen_width, screen_height;
 int so_patch_code(void *dst, const void *src, unsigned long len);   /* so_util.c */
 
-/* ---- touch state, written by android_native_feed_hid every frame ---------- */
-int   g_hook_count = 0;                 /* Input.touchCount (0/1)                        */
-int   g_hook_btn   = 0;                 /* Input.GetMouseButton(0)                       */
+/* ---- touch state, written by android_native_feed_hid every frame ----------
+ * Multi-touch: one slot per finger, matched across frames by fingerId so a
+ * finger keeps its phase/delta when other fingers come and go. Slots in their
+ * Ended frame are kept for exactly one frame (Unity reports an ended touch
+ * in the frame it ends, then drops it), then removed. */
+typedef struct {
+  int32_t finger_id;
+  float x, y;               /* current Unity screen space (bottom-left, px) */
+  float prev_x, prev_y;     /* previous frame's position (delta source)    */
+  int32_t phase;            /* TouchPhase: 0 Began 1 Moved 2 Stat 3 Ended  */
+} HookTouch;
+static HookTouch s_touches[NX_HOOK_MAX_TOUCHES];
+static int s_count = 0;     /* slots presented this frame (active + Ended) */
+/* Mouse emulation owns the first finger for the whole gesture. After that
+ * finger lifts, wait for all fingers to lift before starting another click. */
+enum { MOUSE_IDLE, MOUSE_TRACKING, MOUSE_WAIT_CLEAR };
+static int s_mouse_state = MOUSE_IDLE;
+static int32_t s_mouse_finger_id;
+
+int   g_hook_count = 0;                 /* Input.touchCount (active + Ended frame)     */
+int   g_hook_btn   = 0;                 /* Input.GetMouseButton(0), primary finger    */
 int   g_hook_btn_down = 0, g_hook_btn_up = 0;  /* GetMouseButtonDown/Up(0), 1-frame edges */
-int   g_hook_phase = 3;                 /* TouchPhase: 0 Began 1 Moved 2 Stat 3 Ended    */
-float g_hook_x = 0.0f, g_hook_y = 0.0f; /* Unity screen space (bottom-left origin, px)   */
+int   g_hook_phase = 3;                 /* Primary mouse finger's TouchPhase          */
+float g_hook_x = 0.0f, g_hook_y = 0.0f; /* Mouse position, kept on primary lift       */
 
 /* ---- Unity value types (AArch64 return conventions matter) ---------------- */
 typedef struct { float x, y; }    NxV2;
@@ -46,10 +64,14 @@ static uint8_t hk_getMouseButtonDown(int32_t b, void *mi){ (void)mi; return (b==
 static uint8_t hk_getMouseButtonUp(int32_t b, void *mi){ (void)mi; return (b==0) ? (uint8_t)g_hook_btn_up : 0; }
 static NxTouch hk_getTouch(int32_t index, void *mi){
   (void)mi; NxTouch t; memset(&t, 0, sizeof t);
-  if (index == 0) {
-    t.m_Position.x = g_hook_x; t.m_Position.y = g_hook_y;
+  if (index >= 0 && index < s_count) {
+    const HookTouch *h = &s_touches[index];
+    t.m_FingerId = h->finger_id;
+    t.m_Position.x = h->x; t.m_Position.y = h->y;
     t.m_RawPosition = t.m_Position;
-    t.m_Phase = g_hook_phase; t.m_TapCount = 1;
+    t.m_PositionDelta.x = (h->phase == 3) ? 0.0f : h->x - h->prev_x;
+    t.m_PositionDelta.y = (h->phase == 3) ? 0.0f : h->y - h->prev_y;
+    t.m_Phase = h->phase; t.m_TapCount = 1;
     t.m_Pressure = 1.0f; t.m_maxPressure = 1.0f;
   }
   return t;
@@ -93,23 +115,98 @@ void nx_install_language_hook(uintptr_t il2cpp_base) {
   patch_jump(il2cpp_base + RVA_getCurrentLanguage, (void *)hk_getCurrentLanguage);
 }
 
-/* Called by android_native_feed_hid with the current touch, already mapped to Unity screen
- * space (bottom-left origin, game pixels). active=1 while a finger is down; the release frame
- * is reported once as phase Ended (count still 1) so EZGUI sees the tap complete. */
-void nx_input_hook_update(int active, float ux, float uy) {
-  static int prev = 0;
-  g_hook_btn_down = (active && !prev);
-  g_hook_btn_up   = (!active && prev);
-  if (active) {
-    g_hook_count = 1; g_hook_btn = 1;
-    g_hook_x = ux; g_hook_y = uy;
-    g_hook_phase = prev ? 1 /*Moved*/ : 0 /*Began*/;
-  } else if (prev) {                     /* release: one Ended frame at the last position */
-    g_hook_count = 1; g_hook_btn = 0; g_hook_phase = 3 /*Ended*/;
-  } else {
-    g_hook_count = 0; g_hook_btn = 0; g_hook_phase = 3;
+/* Called by android_native_feed_hid with the current touches, already mapped
+ * to Unity screen space (bottom-left origin, game pixels). A finger present
+ * this frame keeps Began (first frame) / Moved / Stationary; a finger that
+ * was present last frame but is absent now is reported once as Ended (count
+ * still includes it, so EZGUI sees the tap/drag complete), then dropped. */
+void nx_input_hook_update_multi(int count, const int32_t *ids,
+                                const float *xs, const float *ys) {
+  HookTouch next[NX_HOOK_MAX_TOUCHES];
+  int n = 0;
+  if (count < 0) count = 0;
+  if (count > NX_HOOK_MAX_TOUCHES) count = NX_HOOK_MAX_TOUCHES;
+
+  /* Every previously active finger needs a slot, either continuing or Ended.
+   * Reserve those slots before admitting new fingers. At capacity, a new
+   * finger can begin next frame, after the old Ended slots are dropped. */
+  int new_slots = NX_HOOK_MAX_TOUCHES;
+  for (int j = 0; j < s_count; j++)
+    if (s_touches[j].phase != 3) new_slots--;
+
+  /* Continuing + admitted new fingers, in caller order. */
+  for (int i = 0; i < count; i++) {
+    int prev_idx = -1;
+    for (int j = 0; j < s_count; j++) {
+      if (s_touches[j].finger_id == ids[i] && s_touches[j].phase != 3) { prev_idx = j; break; }
+    }
+    if (prev_idx < 0) {
+      if (new_slots == 0) continue;
+      new_slots--;
+    }
+    HookTouch *t = &next[n++];
+    t->finger_id = ids[i];
+    t->x = xs[i]; t->y = ys[i];
+    if (prev_idx >= 0) {
+      t->prev_x = s_touches[prev_idx].x; t->prev_y = s_touches[prev_idx].y;
+      t->phase = (t->x == t->prev_x && t->y == t->prev_y) ? 2 /*Stationary*/ : 1 /*Moved*/;
+    } else {
+      t->prev_x = t->x; t->prev_y = t->y;
+      t->phase = 0 /*Began*/;
+    }
   }
-  prev = active;
+  const int active_count = n;
+  /* Lifted fingers: the slots reserved above guarantee one Ended frame. */
+  for (int j = 0; j < s_count && n < NX_HOOK_MAX_TOUCHES; j++) {
+    if (s_touches[j].phase == 3) continue;   /* already in its Ended frame: drop */
+    int still_down = 0;
+    for (int i = 0; i < count; i++) {
+      if (ids[i] == s_touches[j].finger_id) { still_down = 1; break; }
+    }
+    if (!still_down) {
+      HookTouch *t = &next[n++];
+      *t = s_touches[j];
+      t->prev_x = t->x; t->prev_y = t->y;   /* Ended delta reads as 0 */
+      t->phase = 3 /*Ended*/;
+    }
+  }
+
+  for (int i = 0; i < n; i++) s_touches[i] = next[i];
+  s_count = n;
+  g_hook_count = n;
+  /* Mouse edges depend on the owned finger, never on touch-list ordering.
+   * In particular, adding a real finger while A is held must not start a
+   * second click or teleport the mouse to that finger. */
+  const int was_down = g_hook_btn;
+  g_hook_btn = 0;
+  g_hook_phase = 3;
+  if (s_mouse_state == MOUSE_IDLE && active_count > 0) {
+    s_mouse_finger_id = s_touches[0].finger_id;
+    s_mouse_state = MOUSE_TRACKING;
+  }
+  if (s_mouse_state == MOUSE_TRACKING) {
+    s_mouse_state = MOUSE_WAIT_CLEAR;
+    for (int i = 0; i < active_count; i++) {
+      if (s_touches[i].finger_id != s_mouse_finger_id) continue;
+      g_hook_x = s_touches[i].x; g_hook_y = s_touches[i].y;
+      g_hook_phase = s_touches[i].phase;
+      g_hook_btn = 1;
+      s_mouse_state = MOUSE_TRACKING;
+      break;
+    }
+  }
+  g_hook_btn_down = g_hook_btn && !was_down;
+  g_hook_btn_up = !g_hook_btn && was_down;
+  if (count == 0) s_mouse_state = MOUSE_IDLE;
+}
+
+void nx_input_hook_update(int active, float ux, float uy) {
+  if (active) {
+    int32_t id = 0;
+    nx_input_hook_update_multi(1, &id, &ux, &uy);
+  } else {
+    nx_input_hook_update_multi(0, NULL, NULL, NULL);
+  }
 }
 
 /* ---- PlayerPrefs persistence ---------------------------------------------
